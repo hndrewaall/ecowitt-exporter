@@ -32,6 +32,7 @@ sensors_to_track = [
 ]
 
 co2_location = os.environ.get('CO2_LOCATION')
+co2_ch2_location = os.environ.get('CO2_CH2_LOCATION')
 outdoor_location = os.environ.get('OUTDOOR_LOCATION')
 indoor_location = os.environ.get('INDOOR_LOCATION')
 temp1_location = os.environ.get('TEMP1_LOCATION')
@@ -55,6 +56,8 @@ print ('  DISTANCE_UNIT:    ' + distance_unit)
 print ('  IRRADIANCE_UNIT:  ' + irradiance_unit)
 print ('  AQI STANDARD:     ' + aqi_standard)
 print ('  STATION_ID:       ' + station_id)
+print ('  CO2_LOCATION:     ' + (co2_location if co2_location else '(default: co2)'))
+print ('  CO2_CH2_LOCATION: ' + (co2_ch2_location if co2_ch2_location else '(not set — second WH46D not configured)'))
 print ('  SENSORS_TO_TRACK: ' + (','.join(sensors_to_track) if sensors_to_track else '(none)'))
 
 # Declare metrics as a global
@@ -227,6 +230,59 @@ def logecowitt():
 
         elif key == 'co2_24h':
             addmetric(metric='co2', label=['avg_24h', 'ppm'], value=value)
+
+        # Second WH45/WH46D CO2/AQI multi-sensor (channel 2, suffix _co2_ch2).
+        # GW1200B supports up to two WH45/WH46D units; the second uses the
+        # _co2_ch2 suffix convention. Sensor label is 'co2_ch2' so existing
+        # alerts/dashboards keyed on sensor="co2" are not perturbed.
+        # Set CO2_CH2_LOCATION env var to give it a friendly room name.
+        elif key == 'tf_co2_ch2':
+            if temperature_unit == 'c':
+                value = f2c(value)
+            elif temperature_unit == 'k':
+                value = f2k(value)
+            location = co2_ch2_location if co2_ch2_location else 'co2_ch2'
+            addmetric(metric='temp', label=['co2_ch2', temperature_unit, location], value=value)
+            addmetric(metric='sensor_last_report_timestamp',
+                      label=['co2_ch2'], value=time.time())
+
+        elif key == 'humi_co2_ch2':
+            location = co2_ch2_location if co2_ch2_location else 'co2_ch2'
+            addmetric(metric='humidity', label=['co2_ch2', 'percent', location], value=value)
+
+        elif key == 'pm1_co2_ch2':
+            addmetric(metric='pm1', label=['realtime', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm1_24h_co2_ch2':
+            addmetric(metric='pm1', label=['avg_24h', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm25_co2_ch2':
+            addmetric(metric='pm25', label=['realtime', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm25_24h_co2_ch2':
+            addmetric(metric='pm25', label=['avg_24h', 'co2_ch2', 'μgm3'], value=value)
+            aqi = calculate_aqi(standard=aqi_standard, value=value)
+            addmetric(metric='aqi', label=[aqi_standard, 'co2_ch2'], value=aqi)
+
+        elif key == 'pm4_co2_ch2':
+            addmetric(metric='pm4', label=['realtime', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm4_24h_co2_ch2':
+            addmetric(metric='pm4', label=['avg_24h', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm10_co2_ch2':
+            addmetric(metric='pm10', label=['realtime', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'pm10_24h_co2_ch2':
+            addmetric(metric='pm10', label=['avg_24h', 'co2_ch2', 'μgm3'], value=value)
+
+        elif key == 'co2_ch2':
+            # CO2 reading for the second WH46D. Emitted as ecowitt_co2_ch2 to
+            # avoid schema conflicts with the first meter's label-free co2 metric.
+            addmetric(metric='co2_ch2', label=['realtime', 'ppm'], value=value)
+
+        elif key == 'co2_24h_ch2':
+            addmetric(metric='co2_ch2', label=['avg_24h', 'ppm'], value=value)
 
         # PM25 (WH41 channel sensors)
         # 'pm25_ch1', 'pm25_avg_24h_ch1'
@@ -421,6 +477,7 @@ if __name__ == "__main__":
     metrics['aqi'] = Gauge(name='ecowitt_aqi', documentation='Air quality index', labelnames=['standard', 'sensor'])
     metrics['pm10'] = Gauge(name='ecowitt_pm10', documentation='PM10 concentration', labelnames=['series', 'sensor', 'unit'])
     metrics['co2'] = Gauge(name='ecowitt_co2', documentation='CO2 concentration', labelnames=['series', 'unit'])
+    metrics['co2_ch2'] = Gauge(name='ecowitt_co2_ch2', documentation='CO2 concentration (second WH46D)', labelnames=['series', 'unit'])
     metrics['batterystatus'] = Gauge(name='ecowitt_batterystatus', documentation='Battery status', labelnames=['sensor'])
     metrics['batterylevel'] = Gauge(name='ecowitt_batterylevel', documentation='Battery level', labelnames=['sensor'])
     metrics['batteryvoltage'] = Gauge(name='ecowitt_batteryvoltage', documentation='Battery voltage', labelnames=['sensor', 'unit'])
