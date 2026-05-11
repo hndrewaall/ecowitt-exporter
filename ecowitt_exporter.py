@@ -19,6 +19,22 @@ irradiance_unit = os.environ.get('IRRADIANCE_UNIT', 'wm2')
 aqi_standard = os.environ.get('AQI_STANDARD', 'uk')
 station_id = os.environ.get('STATION_ID', 'ecowitt')
 
+# DEVICE_ID_MAP: optional comma-separated list of PASSKEY:short_id mappings.
+# Each element is "<32-char-PASSKEY>:<short_id>".  When set, the exporter
+# substitutes the human-readable short_id (e.g. "2E28") for the raw PASSKEY
+# on every metric that carries a device_id label.  Without a mapping the raw
+# PASSKEY is used as-is (backwards-compatible default).
+#
+# Example (Living Room WH46D=2E28, Den WH46D=2E0B):
+#   DEVICE_ID_MAP=AC5A9D969717D2ECB48871224D8BDB85:2E28,A778ACF872BE1F97F1EA91AC348EF5CC:2E0B
+_device_id_map_raw = os.environ.get('DEVICE_ID_MAP', '')
+device_id_map: dict[str, str] = {}
+for _entry in _device_id_map_raw.split(','):
+    _entry = _entry.strip()
+    if ':' in _entry:
+        _passkey, _short_id = _entry.split(':', 1)
+        device_id_map[_passkey.strip()] = _short_id.strip()
+
 # Comma-separated list of sensor names to pre-seed in
 # ecowitt_sensor_last_report_timestamp_seconds at startup. Without this, the
 # per-sensor freshness metric is only created when a sensor first pushes data,
@@ -55,6 +71,7 @@ print ('  IRRADIANCE_UNIT:  ' + irradiance_unit)
 print ('  AQI STANDARD:     ' + aqi_standard)
 print ('  STATION_ID:       ' + station_id)
 print ('  SENSORS_TO_TRACK: ' + (','.join(sensors_to_track) if sensors_to_track else '(none)'))
+print ('  DEVICE_ID_MAP:    ' + (_device_id_map_raw if _device_id_map_raw else '(none — PASSKEY used as-is)'))
 
 # Declare metrics as a global
 metrics={}
@@ -117,22 +134,20 @@ def logecowitt():
     # Retrieve the POST body
     data = request.form
 
-    # Capture the gateway PASSKEY before it is dropped below.  Every Ecowitt
-    # gateway POST includes the PASSKEY field.  We use it as a `device_id`
-    # label on all CO2/AQ metrics so that two gateways (each with a WH45/WH46D)
-    # pushing to the same exporter produce distinct time-series instead of
-    # colliding on the same sensor="co2" label set.
+    # Resolve the gateway PASSKEY to a short device_id label value.
+    # Every Ecowitt GW1200B POST includes a PASSKEY field (32-char hex).
+    # We use it (or its mapped short alias) as a `device_id` label on all
+    # CO2/AQ and indoor temp/humidity metrics so that two gateways (each
+    # with a WH45/WH46D) produce distinct time-series instead of colliding
+    # on the same sensor= label set.
     #
-    # No human-name translation is done here — the raw PASSKEY hex string is
-    # the label value.  Dashboards and alert rules translate to friendly room
-    # names via label_replace(..., 'location', 'Living Room', 'device_id',
-    # '<hex>') — the same pattern used for soil sensor labels in alert_rules.yml.
-    # This keeps the exporter config-free for meter replacement: swapping a
-    # WH46D only requires a dashboard label_replace update, not an exporter
-    # env-var change + container recreate.
-    device_id = data.get('PASSKEY', '')
+    # If DEVICE_ID_MAP contains a mapping for this PASSKEY, the short alias
+    # (e.g. "2E28" — the WSView Plus device ID printed on the WH46D body)
+    # is used.  Otherwise the raw PASSKEY is used as-is (backwards compat).
+    passkey = data.get('PASSKEY', '')
+    device_id = device_id_map.get(passkey, passkey)
     if debug:
-        app.logger.debug("PASSKEY/device_id=%s", device_id)
+        app.logger.debug("PASSKEY=%s device_id=%s", passkey, device_id)
 
     for key in data:
         # Process each key from the raw data, do unit conversions if necessary,
@@ -295,14 +310,17 @@ def logecowitt():
                 case 'humidity':
                     label = 'outdoor'
                     location = outdoor_location if outdoor_location else label
+                    dev = ''
                 case 'humidityin':
                     label = 'indoor'
                     location = indoor_location if indoor_location else label
+                    dev = device_id
                 case _:
                     label = f'ch{key[-1]}'
                     location = globals()[f'temp{key[-1]}_location']
+                    dev = ''
             # pylint: disable=used-before-assignment
-            addmetric(metric='humidity', label=[label, 'percent', location], value=value)
+            addmetric(metric='humidity', label=[label, 'percent', location, dev], value=value)
 
         # Solar irradiance, default W/m^2
         elif key in ['solarradiation']:
@@ -326,14 +344,17 @@ def logecowitt():
             if key == 'tempin':
                 label = 'indoor'
                 location = indoor_location if indoor_location else label
+                dev = device_id
             elif key == 'temp':
                 label = 'outdoor'
                 location = outdoor_location if outdoor_location else label
+                dev = ''
             else:
                 label = f'ch{key[-1]}'
                 location = globals()[f'temp{key[-1]}_location']
+                dev = ''
 
-            addmetric(metric='temp', label=[label, temperature_unit, location], value=value)
+            addmetric(metric='temp', label=[label, temperature_unit, location, dev], value=value)
 
         # Pressure, default inches Hg
         elif key.startswith('barom'):
@@ -428,8 +449,13 @@ if __name__ == "__main__":
     metrics['stationtype'] = Info(name='ecowitt_stationtype', documentation='Ecowitt station type')
     metrics['freq'] = Info(name='ecowitt_freq', documentation='Ecowitt radio frequency')
     metrics['model'] = Info(name='ecowitt_model', documentation='Ecowitt model')
-    metrics['temp'] = Gauge(name='ecowitt_temp', documentation='Temperature', labelnames=['sensor', 'unit', 'location'])
-    metrics['humidity'] = Gauge(name='ecowitt_humidity', documentation='Relative humidity', labelnames=['sensor', 'unit', 'location'])
+    # device_id label: non-empty only for sensor="indoor" (gateway onboard
+    # temp/humi).  Two gateways in the same room both push tempinf/humidityin
+    # but historically overwrote each other's series.  With device_id, each
+    # gateway's indoor reading is a distinct series.  For outdoor and CH*
+    # sensors device_id='' (they are not shared between gateways).
+    metrics['temp'] = Gauge(name='ecowitt_temp', documentation='Temperature', labelnames=['sensor', 'unit', 'location', 'device_id'])
+    metrics['humidity'] = Gauge(name='ecowitt_humidity', documentation='Relative humidity', labelnames=['sensor', 'unit', 'location', 'device_id'])
     # CO2/AQ sensor temperature and humidity — separate metrics from the
     # general temp/humidity gauges so device_id can be a label without
     # polluting the label set of non-AQ temperature sensors.
@@ -478,8 +504,10 @@ if __name__ == "__main__":
     # losing radio sync (plants going unwatered) and WH41 PM2.5 sensors going
     # offline are real failure modes we want to alert on.
     #
-    # For WH45/WH46D AQ meters: sensor="co2" with device_id=<passkey> so
-    # two gateways can be monitored independently for freshness.
+    # For WH45/WH46D AQ meters: sensor="co2" with device_id=<short_id> so
+    # two gateways can be monitored independently for freshness.  The
+    # short_id is resolved from DEVICE_ID_MAP at request time; without a
+    # mapping, the raw PASSKEY is used (backwards-compatible).
     metrics['sensor_last_report_timestamp'] = Gauge(
         name='ecowitt_sensor_last_report_timestamp_seconds',
         documentation='Unix timestamp of the most recent report from a specific sensor. Use `time() - ecowitt_sensor_last_report_timestamp_seconds{sensor="soilmoisture1"} > N` to detect a stale individual sensor.',
