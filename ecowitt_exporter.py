@@ -19,21 +19,11 @@ irradiance_unit = os.environ.get('IRRADIANCE_UNIT', 'wm2')
 aqi_standard = os.environ.get('AQI_STANDARD', 'uk')
 station_id = os.environ.get('STATION_ID', 'ecowitt')
 
-# DEVICE_ID_MAP: optional comma-separated list of PASSKEY:short_id mappings.
-# Each element is "<32-char-PASSKEY>:<short_id>".  When set, the exporter
-# substitutes the human-readable short_id (e.g. "2E28") for the raw PASSKEY
-# on every metric that carries a device_id label.  Without a mapping the raw
-# PASSKEY is used as-is (backwards-compatible default).
-#
-# Example (Living Room WH46D=2E28, Den WH46D=2E0B):
-#   DEVICE_ID_MAP=AC5A9D969717D2ECB48871224D8BDB85:2E28,A778ACF872BE1F97F1EA91AC348EF5CC:2E0B
-_device_id_map_raw = os.environ.get('DEVICE_ID_MAP', '')
-device_id_map: dict[str, str] = {}
-for _entry in _device_id_map_raw.split(','):
-    _entry = _entry.strip()
-    if ':' in _entry:
-        _passkey, _short_id = _entry.split(':', 1)
-        device_id_map[_passkey.strip()] = _short_id.strip()
+# The DEVICE_ID_MAP env var has been removed. The exporter now emits the raw
+# PASSKEY as a `gateway_passkey` label on every metric that previously used
+# `device_id`.  Friendly room names are applied via metric_relabel_configs in
+# prometheus.yml (passkey → room label), which also drops the raw passkey from
+# stored series so that long hex strings never appear in the TSDB.
 
 # Comma-separated list of sensor names to pre-seed in
 # ecowitt_sensor_last_report_timestamp_seconds at startup. Without this, the
@@ -71,7 +61,6 @@ print ('  IRRADIANCE_UNIT:  ' + irradiance_unit)
 print ('  AQI STANDARD:     ' + aqi_standard)
 print ('  STATION_ID:       ' + station_id)
 print ('  SENSORS_TO_TRACK: ' + (','.join(sensors_to_track) if sensors_to_track else '(none)'))
-print ('  DEVICE_ID_MAP:    ' + (_device_id_map_raw if _device_id_map_raw else '(none — PASSKEY used as-is)'))
 
 # Declare metrics as a global
 metrics={}
@@ -134,20 +123,17 @@ def logecowitt():
     # Retrieve the POST body
     data = request.form
 
-    # Resolve the gateway PASSKEY to a short device_id label value.
-    # Every Ecowitt GW1200B POST includes a PASSKEY field (32-char hex).
-    # We use it (or its mapped short alias) as a `device_id` label on all
+    # Emit the raw gateway PASSKEY as the `gateway_passkey` label on all
     # CO2/AQ and indoor temp/humidity metrics so that two gateways (each
     # with a WH45/WH46D) produce distinct time-series instead of colliding
     # on the same sensor= label set.
     #
-    # If DEVICE_ID_MAP contains a mapping for this PASSKEY, the short alias
-    # (e.g. "2E28" — the WSView Plus device ID printed on the WH46D body)
-    # is used.  Otherwise the raw PASSKEY is used as-is (backwards compat).
+    # The Prometheus scrape config applies metric_relabel_configs to map
+    # each PASSKEY to a friendly `room` label and then drops `gateway_passkey`
+    # from stored series — so the TSDB never stores long hex strings.
     passkey = data.get('PASSKEY', '')
-    device_id = device_id_map.get(passkey, passkey)
     if debug:
-        app.logger.debug("PASSKEY=%s device_id=%s", passkey, device_id)
+        app.logger.debug("PASSKEY=%s", passkey)
 
     for key in data:
         # Process each key from the raw data, do unit conversions if necessary,
@@ -208,10 +194,10 @@ def logecowitt():
         # WH46D extends this with pm1_co2, pm1_24h_co2, pm4_co2, pm4_24h_co2
         # on the same _co2 suffix convention.
         #
-        # All CO2/AQ metrics carry a `device_id` label (the gateway PASSKEY)
+        # All CO2/AQ metrics carry a `gateway_passkey` label (the raw PASSKEY)
         # so two gateways each pushing one WH46D produce distinct series.
-        # Human-readable room names are translated via label_replace in
-        # dashboards and alert rules — the exporter itself stays config-free.
+        # Human-readable room names are assigned via metric_relabel_configs in
+        # prometheus.yml; the raw passkey is then dropped from stored series.
         #
         # Must be checked BEFORE the generic pm25 handler.
         elif key == 'tf_co2':
@@ -219,46 +205,46 @@ def logecowitt():
                 value = f2c(value)
             elif temperature_unit == 'k':
                 value = f2k(value)
-            addmetric(metric='temp_co2', label=[temperature_unit, device_id], value=value)
+            addmetric(metric='temp_co2', label=[temperature_unit, passkey], value=value)
             addmetric(metric='sensor_last_report_timestamp',
-                      label=['co2', device_id], value=time.time())
+                      label=['co2', passkey], value=time.time())
 
         elif key == 'humi_co2':
-            addmetric(metric='humidity_co2', label=['percent', device_id], value=value)
+            addmetric(metric='humidity_co2', label=['percent', passkey], value=value)
 
         # WH46D: PM1.0 (not reported by WH45).
         elif key == 'pm1_co2':
-            addmetric(metric='pm1_co2', label=['realtime', 'μgm3', device_id], value=value)
+            addmetric(metric='pm1_co2', label=['realtime', 'μgm3', passkey], value=value)
 
         elif key == 'pm1_24h_co2':
-            addmetric(metric='pm1_co2', label=['avg_24h', 'μgm3', device_id], value=value)
+            addmetric(metric='pm1_co2', label=['avg_24h', 'μgm3', passkey], value=value)
 
         elif key == 'pm25_co2':
-            addmetric(metric='pm25_co2', label=['realtime', 'μgm3', device_id], value=value)
+            addmetric(metric='pm25_co2', label=['realtime', 'μgm3', passkey], value=value)
 
         elif key == 'pm25_24h_co2':
-            addmetric(metric='pm25_co2', label=['avg_24h', 'μgm3', device_id], value=value)
+            addmetric(metric='pm25_co2', label=['avg_24h', 'μgm3', passkey], value=value)
             aqi = calculate_aqi(standard=aqi_standard, value=value)
-            addmetric(metric='aqi_co2', label=[aqi_standard, device_id], value=aqi)
+            addmetric(metric='aqi_co2', label=[aqi_standard, passkey], value=aqi)
 
         # WH46D: PM4.0 (not reported by WH45).
         elif key == 'pm4_co2':
-            addmetric(metric='pm4_co2', label=['realtime', 'μgm3', device_id], value=value)
+            addmetric(metric='pm4_co2', label=['realtime', 'μgm3', passkey], value=value)
 
         elif key == 'pm4_24h_co2':
-            addmetric(metric='pm4_co2', label=['avg_24h', 'μgm3', device_id], value=value)
+            addmetric(metric='pm4_co2', label=['avg_24h', 'μgm3', passkey], value=value)
 
         elif key == 'pm10_co2':
-            addmetric(metric='pm10_co2', label=['realtime', 'μgm3', device_id], value=value)
+            addmetric(metric='pm10_co2', label=['realtime', 'μgm3', passkey], value=value)
 
         elif key == 'pm10_24h_co2':
-            addmetric(metric='pm10_co2', label=['avg_24h', 'μgm3', device_id], value=value)
+            addmetric(metric='pm10_co2', label=['avg_24h', 'μgm3', passkey], value=value)
 
         elif key == 'co2':
-            addmetric(metric='co2', label=['realtime', 'ppm', device_id], value=value)
+            addmetric(metric='co2', label=['realtime', 'ppm', passkey], value=value)
 
         elif key == 'co2_24h':
-            addmetric(metric='co2', label=['avg_24h', 'ppm', device_id], value=value)
+            addmetric(metric='co2', label=['avg_24h', 'ppm', passkey], value=value)
 
         # PM25 (WH41 channel sensors)
         # 'pm25_ch1', 'pm25_avg_24h_ch1'
@@ -314,7 +300,7 @@ def logecowitt():
                 case 'humidityin':
                     label = 'indoor'
                     location = indoor_location if indoor_location else label
-                    dev = device_id
+                    dev = passkey
                 case _:
                     label = f'ch{key[-1]}'
                     location = globals()[f'temp{key[-1]}_location']
@@ -344,7 +330,7 @@ def logecowitt():
             if key == 'tempin':
                 label = 'indoor'
                 location = indoor_location if indoor_location else label
-                dev = device_id
+                dev = passkey
             elif key == 'temp':
                 label = 'outdoor'
                 location = outdoor_location if outdoor_location else label
@@ -449,28 +435,30 @@ if __name__ == "__main__":
     metrics['stationtype'] = Info(name='ecowitt_stationtype', documentation='Ecowitt station type')
     metrics['freq'] = Info(name='ecowitt_freq', documentation='Ecowitt radio frequency')
     metrics['model'] = Info(name='ecowitt_model', documentation='Ecowitt model')
-    # device_id label: non-empty only for sensor="indoor" (gateway onboard
+    # gateway_passkey label: non-empty only for sensor="indoor" (gateway onboard
     # temp/humi).  Two gateways in the same room both push tempinf/humidityin
-    # but historically overwrote each other's series.  With device_id, each
+    # but historically overwrote each other's series.  With gateway_passkey, each
     # gateway's indoor reading is a distinct series.  For outdoor and CH*
-    # sensors device_id='' (they are not shared between gateways).
-    metrics['temp'] = Gauge(name='ecowitt_temp', documentation='Temperature', labelnames=['sensor', 'unit', 'location', 'device_id'])
-    metrics['humidity'] = Gauge(name='ecowitt_humidity', documentation='Relative humidity', labelnames=['sensor', 'unit', 'location', 'device_id'])
+    # sensors gateway_passkey='' (they are not shared between gateways).
+    # The Prometheus scrape config maps each passkey to a friendly `room` label
+    # and drops gateway_passkey from stored series.
+    metrics['temp'] = Gauge(name='ecowitt_temp', documentation='Temperature', labelnames=['sensor', 'unit', 'location', 'gateway_passkey'])
+    metrics['humidity'] = Gauge(name='ecowitt_humidity', documentation='Relative humidity', labelnames=['sensor', 'unit', 'location', 'gateway_passkey'])
     # CO2/AQ sensor temperature and humidity — separate metrics from the
-    # general temp/humidity gauges so device_id can be a label without
+    # general temp/humidity gauges so gateway_passkey can be a label without
     # polluting the label set of non-AQ temperature sensors.
-    metrics['temp_co2'] = Gauge(name='ecowitt_temp_co2', documentation='Temperature from WH45/WH46D CO2/AQ sensor', labelnames=['unit', 'device_id'])
-    metrics['humidity_co2'] = Gauge(name='ecowitt_humidity_co2', documentation='Relative humidity from WH45/WH46D CO2/AQ sensor', labelnames=['unit', 'device_id'])
+    metrics['temp_co2'] = Gauge(name='ecowitt_temp_co2', documentation='Temperature from WH45/WH46D CO2/AQ sensor', labelnames=['unit', 'gateway_passkey'])
+    metrics['humidity_co2'] = Gauge(name='ecowitt_humidity_co2', documentation='Relative humidity from WH45/WH46D CO2/AQ sensor', labelnames=['unit', 'gateway_passkey'])
     metrics['winddir'] = Gauge(name='ecowitt_winddir', documentation='Wind direction')
     metrics['uv'] = Gauge(name='ecowitt_uv', documentation='UV index')
-    # CO2/AQ PM metrics: per-device_id so two gateways each with a WH46D do
-    # not overwrite each other's readings.
-    metrics['pm1_co2'] = Gauge(name='ecowitt_pm1_co2', documentation='PM1.0 concentration from WH46D', labelnames=['series', 'unit', 'device_id'])
-    metrics['pm25_co2'] = Gauge(name='ecowitt_pm25_co2', documentation='PM2.5 concentration from WH45/WH46D', labelnames=['series', 'unit', 'device_id'])
-    metrics['pm4_co2'] = Gauge(name='ecowitt_pm4_co2', documentation='PM4.0 concentration from WH46D', labelnames=['series', 'unit', 'device_id'])
-    metrics['pm10_co2'] = Gauge(name='ecowitt_pm10_co2', documentation='PM10 concentration from WH45/WH46D', labelnames=['series', 'unit', 'device_id'])
-    metrics['aqi_co2'] = Gauge(name='ecowitt_aqi_co2', documentation='Air quality index from WH45/WH46D', labelnames=['standard', 'device_id'])
-    metrics['co2'] = Gauge(name='ecowitt_co2', documentation='CO2 concentration', labelnames=['series', 'unit', 'device_id'])
+    # CO2/AQ PM metrics: per-gateway_passkey so two gateways each with a WH46D
+    # do not overwrite each other's readings.
+    metrics['pm1_co2'] = Gauge(name='ecowitt_pm1_co2', documentation='PM1.0 concentration from WH46D', labelnames=['series', 'unit', 'gateway_passkey'])
+    metrics['pm25_co2'] = Gauge(name='ecowitt_pm25_co2', documentation='PM2.5 concentration from WH45/WH46D', labelnames=['series', 'unit', 'gateway_passkey'])
+    metrics['pm4_co2'] = Gauge(name='ecowitt_pm4_co2', documentation='PM4.0 concentration from WH46D', labelnames=['series', 'unit', 'gateway_passkey'])
+    metrics['pm10_co2'] = Gauge(name='ecowitt_pm10_co2', documentation='PM10 concentration from WH45/WH46D', labelnames=['series', 'unit', 'gateway_passkey'])
+    metrics['aqi_co2'] = Gauge(name='ecowitt_aqi_co2', documentation='Air quality index from WH45/WH46D', labelnames=['standard', 'gateway_passkey'])
+    metrics['co2'] = Gauge(name='ecowitt_co2', documentation='CO2 concentration', labelnames=['series', 'unit', 'gateway_passkey'])
     # WH41 channel PM2.5 (separate from the WH45/WH46D co2-suffix metrics above)
     metrics['pm25'] = Gauge(name='ecowitt_pm25', documentation='PM2.5 concentration (WH41 channel sensors)', labelnames=['series', 'sensor', 'unit'])
     metrics['aqi'] = Gauge(name='ecowitt_aqi', documentation='Air quality index (WH41 channel sensors)', labelnames=['standard', 'sensor'])
@@ -504,14 +492,13 @@ if __name__ == "__main__":
     # losing radio sync (plants going unwatered) and WH41 PM2.5 sensors going
     # offline are real failure modes we want to alert on.
     #
-    # For WH45/WH46D AQ meters: sensor="co2" with device_id=<short_id> so
-    # two gateways can be monitored independently for freshness.  The
-    # short_id is resolved from DEVICE_ID_MAP at request time; without a
-    # mapping, the raw PASSKEY is used (backwards-compatible).
+    # For WH45/WH46D AQ meters: sensor="co2" with gateway_passkey=<raw PASSKEY>
+    # so two gateways can be monitored independently for freshness.  The
+    # Prometheus scrape config maps the passkey to a friendly `room` label.
     metrics['sensor_last_report_timestamp'] = Gauge(
         name='ecowitt_sensor_last_report_timestamp_seconds',
         documentation='Unix timestamp of the most recent report from a specific sensor. Use `time() - ecowitt_sensor_last_report_timestamp_seconds{sensor="soilmoisture1"} > N` to detect a stale individual sensor.',
-        labelnames=['sensor', 'device_id']
+        labelnames=['sensor', 'gateway_passkey']
     )
 
     # Pre-seed per-sensor freshness timestamps for every sensor named in
@@ -524,9 +511,9 @@ if __name__ == "__main__":
     # the alert silently never fires. Seeding with `time.time()` gives a
     # grace period equal to the alert's `for:` duration before it trips.
     for sensor_name in sensors_to_track:
-        # device_id='' for non-AQ sensors (soil probes, WH41 PM2.5); the AQ
-        # sensors (co2 key) get device_id seeded via addmetric on first push.
-        metrics['sensor_last_report_timestamp'].labels(sensor=sensor_name, device_id='').set(time.time())
+        # gateway_passkey='' for non-AQ sensors (soil probes, WH41 PM2.5); the
+        # AQ sensors (co2 key) get gateway_passkey seeded via addmetric on first push.
+        metrics['sensor_last_report_timestamp'].labels(sensor=sensor_name, gateway_passkey='').set(time.time())
 
     # Increase Flask logging if in debug mode
     if debug:
