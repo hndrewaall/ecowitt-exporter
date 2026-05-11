@@ -7,6 +7,12 @@ canned WH46D push body from `test_fixtures/wh46d_post.txt`, and scrapes
 PM10 — each in realtime and avg_24h series) alongside the existing WH45
 CO2/temp/humidity metrics.
 
+As of the device-id labeling redesign, WH45/WH46D metrics are emitted under
+device-specific metric names (ecowitt_pm1_co2, ecowitt_pm25_co2,
+ecowitt_pm4_co2, ecowitt_pm10_co2, ecowitt_aqi_co2, ecowitt_co2) with a
+`device_id` label carrying the gateway PASSKEY.  This lets two gateways each
+pushing a WH46D produce distinct time-series without colliding.
+
 Run directly: `python3 test_wh46d.py`
 """
 
@@ -22,6 +28,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 FIXTURE = REPO_ROOT / "test_fixtures" / "wh46d_post.txt"
+
+# PASSKEY value embedded in the fixture — used to construct expected label sets.
+FIXTURE_PASSKEY = "E05DDF79DADE150B6477AE0772D37CF8"
 
 
 def _pick_port() -> int:
@@ -47,6 +56,8 @@ def main() -> int:
     # Sanity check: the fixture must contain all four WH46D PM keys.
     for k in ("pm1_co2", "pm1_24h_co2", "pm4_co2", "pm4_24h_co2"):
         assert k in body, f"fixture missing {k}"
+    # Sanity check: fixture must have a PASSKEY
+    assert f"PASSKEY={FIXTURE_PASSKEY}" in body, f"fixture PASSKEY mismatch"
 
     port = _pick_port()
     env = dict(os.environ)
@@ -88,22 +99,23 @@ def main() -> int:
         ) as resp:
             metrics_text = resp.read().decode("utf-8")
 
+        pk = FIXTURE_PASSKEY
         expected = [
-            # PM1.0 (WH46D only)
-            'ecowitt_pm1{sensor="co2",series="realtime",unit="μgm3"} 6.1',
-            'ecowitt_pm1{sensor="co2",series="avg_24h",unit="μgm3"} 5.8',
-            # PM2.5 (WH45 + WH46D)
-            'ecowitt_pm25{sensor="co2",series="realtime",unit="μgm3"} 9.8',
-            'ecowitt_pm25{sensor="co2",series="avg_24h",unit="μgm3"} 8.4',
-            # PM4.0 (WH46D only)
-            'ecowitt_pm4{sensor="co2",series="realtime",unit="μgm3"} 11.2',
-            'ecowitt_pm4{sensor="co2",series="avg_24h",unit="μgm3"} 10.5',
-            # PM10 (WH45 + WH46D)
-            'ecowitt_pm10{sensor="co2",series="realtime",unit="μgm3"} 13.0',
-            'ecowitt_pm10{sensor="co2",series="avg_24h",unit="μgm3"} 12.1',
-            # CO2 (WH45 + WH46D)
-            'ecowitt_co2{series="realtime",unit="ppm"} 623.0',
-            'ecowitt_co2{series="avg_24h",unit="ppm"} 580.0',
+            # PM1.0 (WH46D only) — new ecowitt_pm1_co2 metric with device_id label
+            f'ecowitt_pm1_co2{{device_id="{pk}",series="realtime",unit="μgm3"}} 6.1',
+            f'ecowitt_pm1_co2{{device_id="{pk}",series="avg_24h",unit="μgm3"}} 5.8',
+            # PM2.5 (WH45 + WH46D) — new ecowitt_pm25_co2 metric with device_id label
+            f'ecowitt_pm25_co2{{device_id="{pk}",series="realtime",unit="μgm3"}} 9.8',
+            f'ecowitt_pm25_co2{{device_id="{pk}",series="avg_24h",unit="μgm3"}} 8.4',
+            # PM4.0 (WH46D only) — new ecowitt_pm4_co2 metric with device_id label
+            f'ecowitt_pm4_co2{{device_id="{pk}",series="realtime",unit="μgm3"}} 11.2',
+            f'ecowitt_pm4_co2{{device_id="{pk}",series="avg_24h",unit="μgm3"}} 10.5',
+            # PM10 (WH45 + WH46D) — new ecowitt_pm10_co2 metric with device_id label
+            f'ecowitt_pm10_co2{{device_id="{pk}",series="realtime",unit="μgm3"}} 13.0',
+            f'ecowitt_pm10_co2{{device_id="{pk}",series="avg_24h",unit="μgm3"}} 12.1',
+            # CO2 (WH45 + WH46D) — device_id label added
+            f'ecowitt_co2{{device_id="{pk}",series="realtime",unit="ppm"}} 623.0',
+            f'ecowitt_co2{{device_id="{pk}",series="avg_24h",unit="ppm"}} 580.0',
         ]
         missing = [m for m in expected if m not in metrics_text]
         if missing:
