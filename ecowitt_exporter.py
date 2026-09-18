@@ -37,6 +37,19 @@ sensors_to_track = [
     s.strip() for s in os.environ.get('SENSORS_TO_TRACK', '').split(',') if s.strip()
 ]
 
+# Comma-separated list of gateway PASSKEYs to pre-seed in
+# ecowitt_gateway_last_report_timestamp_seconds at startup, for exactly the same
+# reason as SENSORS_TO_TRACK above: a per-gateway gauge only comes into
+# existence on that gateway's first push, so if the exporter restarts while a
+# gateway is already offline, `time() - <missing> > N` returns no data and the
+# staleness alert silently never fires — which is the failure this metric
+# exists to catch. Seeded children carry gateway_ip='' until the gateway's
+# first real push, which relabels the child to the observed source IP (see
+# track_gateway_report).
+gateways_to_track = [
+    g.strip() for g in os.environ.get('GATEWAYS_TO_TRACK', '').split(',') if g.strip()
+]
+
 outdoor_location = os.environ.get('OUTDOOR_LOCATION')
 indoor_location = os.environ.get('INDOOR_LOCATION')
 temp1_location = os.environ.get('TEMP1_LOCATION')
@@ -61,6 +74,7 @@ print ('  IRRADIANCE_UNIT:  ' + irradiance_unit)
 print ('  AQI STANDARD:     ' + aqi_standard)
 print ('  STATION_ID:       ' + station_id)
 print ('  SENSORS_TO_TRACK: ' + (','.join(sensors_to_track) if sensors_to_track else '(none)'))
+print ('  GATEWAYS_TO_TRACK: ' + (str(len(gateways_to_track)) + ' passkey(s)' if gateways_to_track else '(none)'))
 
 # Declare metrics as a global
 metrics={}
@@ -86,6 +100,39 @@ rainmaps = {
         "mrain_piezo": "monthlyrain",
         "yrain_piezo": "yearlyrain"
 }
+
+# Last source IP seen for each gateway PASSKEY. Used to keep exactly one
+# child of ecowitt_gateway_last_report_timestamp_seconds alive per gateway: if a
+# gateway's IP changes (DHCP) the old {passkey, old_ip} child would otherwise
+# freeze at its last value forever and look like a permanently stale gateway.
+gateway_last_ip = {}
+
+
+def track_gateway_report(passkey: str, source_ip: str):
+    '''
+    Record the wall-clock time of a successful push from ONE gateway, keyed by
+    its PASSKEY (and labelled with the source IP it pushed from).
+
+    The global ecowitt_last_report_timestamp_seconds gauge is shared by every
+    gateway posting to this exporter, so ANY gateway's push refreshes it: with
+    two or more gateways it cannot detect a single gateway going offline (this
+    bit us on 2026-09-18, when the soil-probe gateway dropped for 10 minutes
+    and only the per-sensor alerts noticed). This per-gateway gauge is the
+    freshness signal to alert on; the global one is kept unchanged for
+    backwards compatibility.
+    '''
+    previous_ip = gateway_last_ip.get(passkey)
+    if previous_ip is not None and previous_ip != source_ip:
+        # Drop the stale child so a DHCP address change does not leave a
+        # frozen timestamp behind that alerts forever.
+        try:
+            metrics['gateway_last_report_timestamp'].remove(passkey, previous_ip)
+        except KeyError:
+            pass
+    gateway_last_ip[passkey] = source_ip
+    addmetric(metric='gateway_last_report_timestamp',
+              label=[passkey, source_ip], value=time.time())
+
 
 # pylint: disable=dangerous-default-value
 def addmetric(metric: str, value: str, label: list = []):
@@ -421,6 +468,11 @@ def logecowitt():
     # or out of radio range).
     metrics['last_report_timestamp'].set(time.time())
 
+    # Per-gateway freshness. The global gauge above is refreshed by ANY
+    # gateway, so it cannot see one of several gateways go offline; this one
+    # is keyed by the pushing gateway's PASSKEY.
+    track_gateway_report(passkey, request.remote_addr or '')
+
     # Return a 200 to the weather station
     response = app.response_class(
             response='OK',
@@ -500,6 +552,33 @@ if __name__ == "__main__":
         documentation='Unix timestamp of the most recent report from a specific sensor. Use `time() - ecowitt_sensor_last_report_timestamp_seconds{sensor="soilmoisture1"} > N` to detect a stale individual sensor.',
         labelnames=['sensor', 'gateway_passkey']
     )
+
+    # Per-GATEWAY last-seen timestamp. ecowitt_last_report_timestamp_seconds
+    # (above) is a single global gauge that ANY gateway's POST refreshes, so
+    # with more than one gateway pushing to this exporter it can only detect
+    # "all gateways are gone". This gauge is keyed by the gateway's PASSKEY so
+    # each gateway's freshness is independent:
+    #   time() - ecowitt_gateway_last_report_timestamp_seconds > 300
+    # fires per gateway. gateway_ip carries the source address of the last
+    # push, so an alert can name the gateway even when the Prometheus scrape
+    # config drops the raw passkey from stored series (it maps passkey -> a
+    # friendly `room` label first).
+    metrics['gateway_last_report_timestamp'] = Gauge(
+        name='ecowitt_gateway_last_report_timestamp_seconds',
+        documentation='Unix timestamp of the most recent successful POST from a specific Ecowitt gateway to /report, keyed by that gateway PASSKEY. Use `time() - ecowitt_gateway_last_report_timestamp_seconds > N` to detect one stale or offline gateway among several.',
+        labelnames=['gateway_passkey', 'gateway_ip']
+    )
+
+    # Pre-seed per-gateway freshness for every PASSKEY named in
+    # GATEWAYS_TO_TRACK, for the same reason the per-sensor metric is seeded
+    # below: without it, a gateway that is already offline when the exporter
+    # restarts has no series at all, and the staleness alert returns no data
+    # instead of firing. gateway_ip is '' until the first real push, which
+    # removes the seeded child and replaces it with the observed IP.
+    for gateway_passkey in gateways_to_track:
+        metrics['gateway_last_report_timestamp'].labels(
+            gateway_passkey=gateway_passkey, gateway_ip='').set(time.time())
+        gateway_last_ip[gateway_passkey] = ''
 
     # Pre-seed per-sensor freshness timestamps for every sensor named in
     # SENSORS_TO_TRACK. This ensures the metric exists for each expected
