@@ -1,7 +1,10 @@
 import os
 import logging
+import json
 import re
+import threading
 import time
+import urllib.request
 from flask import Flask, request
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from prometheus_client import make_wsgi_app, Gauge, Info
@@ -50,6 +53,20 @@ gateways_to_track = [
     g.strip() for g in os.environ.get('GATEWAYS_TO_TRACK', '').split(',') if g.strip()
 ]
 
+# Comma-separated base URLs (e.g. http://host) of gateways whose LOCAL HTTP API
+# should be polled for hardware sensor IDs. The push protocol the gateway sends
+# to /report carries only channel numbers, never the per-sensor hardware ID, so
+# a soil probe is identified purely by the channel it happens to be bound to --
+# and a power cycle or re-pair can renumber the channels, silently attaching
+# every downstream label to the wrong physical probe. The gateway's
+# `get_sensors_info` call does list each bound sensor's ID, so polling it lets
+# us publish a channel -> hardware-ID association that a re-pair cannot hide.
+# Unset = feature disabled (no polling, no extra metric children).
+gateway_api_urls = [
+    u.strip().rstrip('/') for u in os.environ.get('GATEWAY_API_URLS', '').split(',') if u.strip()
+]
+gateway_api_interval = int(os.environ.get('GATEWAY_API_INTERVAL', '60'))
+
 outdoor_location = os.environ.get('OUTDOOR_LOCATION')
 indoor_location = os.environ.get('INDOOR_LOCATION')
 temp1_location = os.environ.get('TEMP1_LOCATION')
@@ -74,6 +91,7 @@ print ('  IRRADIANCE_UNIT:  ' + irradiance_unit)
 print ('  AQI STANDARD:     ' + aqi_standard)
 print ('  STATION_ID:       ' + station_id)
 print ('  SENSORS_TO_TRACK: ' + (','.join(sensors_to_track) if sensors_to_track else '(none)'))
+print ('  GATEWAY_API_URLS: ' + (str(len(gateway_api_urls)) + ' gateway(s), every ' + str(gateway_api_interval) + 's' if gateway_api_urls else '(none)'))
 print ('  GATEWAYS_TO_TRACK: ' + (str(len(gateways_to_track)) + ' passkey(s)' if gateways_to_track else '(none)'))
 
 # Declare metrics as a global
@@ -132,6 +150,82 @@ def track_gateway_report(passkey: str, source_ip: str):
     gateway_last_ip[passkey] = source_ip
     addmetric(metric='gateway_last_report_timestamp',
               label=[passkey, source_ip], value=time.time())
+
+
+# WH51 soil-moisture sensor types in the gateway's get_sensors_info listing.
+# Channels 1-8 are types 14-21; channels 9-16 are types 58-65.
+SOIL_TYPE_TO_CHANNEL = {**{14 + i: 1 + i for i in range(8)},
+                        **{58 + i: 9 + i for i in range(8)}}
+# Placeholder IDs the gateway reports for an unbound / disabled slot.
+UNBOUND_SENSOR_IDS = {'FFFFFFFE', 'FFFFFFFF', '', '0'}
+
+# Children of ecowitt_soil_sensor_info currently published, keyed by
+# (gateway_api_url, sensor) -> sensor_id, so a changed ID replaces its old child
+# instead of leaving two series that both claim the same channel.
+soil_info_published = {}
+
+
+def parse_soil_sensors(pages: list) -> dict:
+    '''
+    Turn decoded get_sensors_info pages (a list of lists of sensor dicts) into
+    {"soilmoistureN": "<hardware id>"} for every BOUND WH51 channel.
+    Unbound slots (placeholder IDs) are skipped.
+    '''
+    found = {}
+    for page in pages:
+        for entry in page:
+            try:
+                channel = SOIL_TYPE_TO_CHANNEL.get(int(entry.get('type')))
+            except (TypeError, ValueError):
+                continue
+            sensor_id = str(entry.get('id', '')).strip().upper()
+            if channel is None or sensor_id in UNBOUND_SENSOR_IDS:
+                continue
+            found['soilmoisture%d' % channel] = sensor_id
+    return found
+
+
+def fetch_gateway_pages(base_url: str) -> list:
+    '''Fetch every get_sensors_info page from one gateway.'''
+    with urllib.request.urlopen(base_url + '/get_version', timeout=5) as resp:
+        page_count = int(json.load(resp).get('sensorid_page', '1'))
+    pages = []
+    for page in range(1, page_count + 1):
+        with urllib.request.urlopen(
+                '%s/get_sensors_info?page=%d' % (base_url, page), timeout=5) as resp:
+            pages.append(json.load(resp))
+    return pages
+
+
+def publish_soil_sensor_info(base_url: str, found: dict):
+    '''
+    Reconcile ecowitt_soil_sensor_info{sensor, sensor_id} for one gateway with
+    the freshly polled channel -> ID association.
+    '''
+    for sensor, sensor_id in found.items():
+        previous = soil_info_published.get((base_url, sensor))
+        if previous is not None and previous != sensor_id:
+            metrics['soil_sensor_info'].remove(sensor, previous)
+        metrics['soil_sensor_info'].labels(sensor, sensor_id).set(1)
+        soil_info_published[(base_url, sensor)] = sensor_id
+    for (url, sensor), sensor_id in list(soil_info_published.items()):
+        if url == base_url and sensor not in found:
+            metrics['soil_sensor_info'].remove(sensor, sensor_id)
+            del soil_info_published[(url, sensor)]
+
+
+def poll_gateway_apis_forever():
+    '''Background loop: poll every configured gateway, never raise.'''
+    while True:
+        for base_url in gateway_api_urls:
+            try:
+                publish_soil_sensor_info(base_url, parse_soil_sensors(fetch_gateway_pages(base_url)))
+                metrics['gateway_api_last_success'].labels(base_url).set(time.time())
+            except Exception as err:  # pylint: disable=broad-except
+                # A failed poll keeps the last-known association published;
+                # gateway_api_last_success going stale is the signal.
+                print('gateway API poll failed for %s: %s' % (base_url, err))
+        time.sleep(gateway_api_interval)
 
 
 # pylint: disable=dangerous-default-value
@@ -594,9 +688,27 @@ if __name__ == "__main__":
         # AQ sensors (co2 key) get gateway_passkey seeded via addmetric on first push.
         metrics['sensor_last_report_timestamp'].labels(sensor=sensor_name, gateway_passkey='').set(time.time())
 
+    # Hardware-ID association for WH51 soil probes, from the gateway's local
+    # API (see GATEWAY_API_URLS). Value is always 1; the sensor_id label is
+    # the payload. Join it onto soil series by `sensor` to learn which physical
+    # probe is currently bound to a channel.
+    metrics['soil_sensor_info'] = Gauge(
+        name='ecowitt_soil_sensor_info',
+        documentation='Hardware ID of the WH51 soil probe currently bound to a channel, read from the gateway local API. Always 1.',
+        labelnames=['sensor', 'sensor_id']
+    )
+    metrics['gateway_api_last_success'] = Gauge(
+        name='ecowitt_gateway_api_last_success_timestamp_seconds',
+        documentation='Unix timestamp of the last successful poll of a gateway local API. A stale value means ecowitt_soil_sensor_info may be out of date.',
+        labelnames=['gateway_url']
+    )
+
     # Increase Flask logging if in debug mode
     if debug:
         app.logger.setLevel(logging.DEBUG)
+
+    if gateway_api_urls:
+        threading.Thread(target=poll_gateway_apis_forever, daemon=True).start()
 
     # Add prometheus wsgi middleware to route /metrics requests
     app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
