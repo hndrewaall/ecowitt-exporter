@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("TEMPERATURE_UNIT", "c")
 
-import ecowitt_exporter as ex  # noqa: E402
+import ecowitt_exporter as ex  # noqa: E402  pylint: disable=wrong-import-position
 
 
 def _entry(type_, id_):
@@ -32,7 +32,7 @@ def test_high_channels_and_non_soil_ignored():
 
 
 def test_garbage_type_skipped():
-    assert ex.parse_soil_sensors([[{"type": None, "id": "1"}, {"id": "2"}]]) == {}
+    assert not ex.parse_soil_sensors([[{"type": None, "id": "1"}, {"id": "2"}]])
 
 
 if __name__ == "__main__":
