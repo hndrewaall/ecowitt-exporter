@@ -57,7 +57,7 @@ def main() -> int:
     for k in ("pm1_co2", "pm1_24h_co2", "pm4_co2", "pm4_24h_co2"):
         assert k in body, f"fixture missing {k}"
     # Sanity check: fixture must have a PASSKEY
-    assert f"PASSKEY={FIXTURE_PASSKEY}" in body, f"fixture PASSKEY mismatch"
+    assert f"PASSKEY={FIXTURE_PASSKEY}" in body, "fixture PASSKEY mismatch"
 
     port = _pick_port()
     env = dict(os.environ)
